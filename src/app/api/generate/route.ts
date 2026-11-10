@@ -147,30 +147,43 @@ function parseJsonSafe(rawText: string) {
   try {
     return JSON.parse(rawText);
   } catch {
-    const cleaned = rawText.replace(/```json/gi, "").replace(/```/g, "").trim();
+    const cleaned = rawText
+      .replace(/```json/gi, "")
+      .replace(/```/g, "")
+      .trim();
     return JSON.parse(cleaned);
   }
 }
 
 export async function POST(req: NextRequest) {
+  let detectedKeyName = "None";
+  let lastError: string | null = null;
+
   try {
     const body = await req.json();
     const { tone = "flirty", image = null, text = "" } = body;
 
-    // Support both MERCURY-3 (from Inception Labs), INCEPTION_API_KEY, and AI_API_KEY
+    // Support both MERCURY_API_KEY, MERCURY-3, INCEPTION_API_KEY, and AI_API_KEY
     const inceptionKey =
-      process.env["MERCURY-3"] ||
-      process.env.MERCURY_3 ||
       process.env.MERCURY_API_KEY ||
+      process.env.MERCURY_3 ||
+      process.env["MERCURY-3"] ||
       process.env.INCEPTION_API_KEY;
 
     const apiKey = inceptionKey || process.env.AI_API_KEY;
 
-    // Normalize tone key
+    if (inceptionKey) detectedKeyName = "Inception Labs (Mercury-3)";
+    else if (process.env.AI_API_KEY) detectedKeyName = "AI_API_KEY";
+
     const toneKey = (tone || "flirty").toLowerCase();
     const fallbackList = VIBE_TEMPLATES[toneKey] || VIBE_TEMPLATES.flirty;
 
-    // If an Inception Labs Mercury key is provided
+    // Effective conversation context for prompt
+    const effectiveContext = text && text.trim().length > 0
+      ? text.trim()
+      : "User matched on a dating app (Tinder/Hinge/Bumble) and needs high-converting witty reply options.";
+
+    // 1. Try Inception Labs (Mercury-3)
     if (inceptionKey && inceptionKey.trim() !== "") {
       try {
         const inceptionRes = await fetch("https://api.inceptionlabs.ai/v1/chat/completions", {
@@ -184,28 +197,28 @@ export async function POST(req: NextRequest) {
             messages: [
               {
                 role: "system",
-                content: `You are RIZZ, the world's best AI dating assistant and wingman. 
-The user is asking for dating replies with tone: '${tone.toUpperCase()}'.
-Return strictly valid JSON with no extra commentary:
+                content: `You are RIZZ, an elite dating wingman AI. You write irresistible, witty, charming dating replies tailored to what the match said.
+Tone: '${tone.toUpperCase()}'.
+Return strictly valid JSON only:
 {
   "suggestions": [
     {
       "category": "The Icebreaker",
-      "text": "First reply line here",
+      "text": "Specific, witty response here",
       "score": "98% Match",
       "vibe": "Quick 2-word vibe",
       "deliveryTip": "Actionable tip on timing/delivery"
     },
     {
       "category": "Smooth Pivot",
-      "text": "Second reply line here",
+      "text": "Specific, clever second option here",
       "score": "96% Match",
       "vibe": "Quick 2-word vibe",
       "deliveryTip": "Actionable tip on timing/delivery"
     },
     {
       "category": "Playful Tease",
-      "text": "Third reply line here",
+      "text": "Specific, bold third option here",
       "score": "99% Match",
       "vibe": "Quick 2-word vibe",
       "deliveryTip": "Actionable tip on timing/delivery"
@@ -215,7 +228,8 @@ Return strictly valid JSON with no extra commentary:
               },
               {
                 role: "user",
-                content: `Generate 3 killer dating reply suggestions in '${tone}' tone. Conversation context: ${text || "Opening a dating match conversation"}`,
+                content: `Here is what the match said or their profile info: "${effectiveContext}".
+Generate 3 distinct dating reply suggestions in '${tone}' tone that directly address what they said!`,
               },
             ],
             temperature: 0.85,
@@ -232,40 +246,42 @@ Return strictly valid JSON with no extra commentary:
                 success: true,
                 tone,
                 isLiveAI: true,
-                engine: "Inception Labs (Mercury-3)",
+                engine: "Inception Labs Mercury-3",
+                keyDetected: true,
                 suggestions: parsed.suggestions.slice(0, 3).map((item: any, idx: number) => ({
                   id: `mercury-${Date.now()}-${idx}`,
                   category: item.category || (idx === 0 ? "The Icebreaker" : idx === 1 ? "Smooth Pivot" : "Playful Tease"),
                   text: item.text,
                   score: item.score || `${95 + Math.floor(Math.random() * 5)}% Match`,
                   vibe: item.vibe || tone,
-                  deliveryTip: item.deliveryTip || "Deliver with confidence.",
+                  deliveryTip: item.deliveryTip || "Send with confidence.",
                 })),
               });
             }
           }
         } else {
-          console.warn("Inception Labs API responded with status:", inceptionRes.status);
+          const errBody = await inceptionRes.text();
+          lastError = `Inception Labs HTTP ${inceptionRes.status}: ${errBody.slice(0, 100)}`;
+          console.error(lastError);
         }
-      } catch (err) {
+      } catch (err: any) {
+        lastError = `Inception call error: ${err.message}`;
         console.error("Inception Labs call failed:", err);
       }
     }
 
-    // If a Gemini or generic AI_API_KEY is present
-    if (apiKey && apiKey.trim() !== "") {
+    // 2. Try Gemini Vision (Multimodal - looks at actual image pixels!)
+    if (apiKey && apiKey.trim() !== "" && (apiKey.startsWith("AIza") || !inceptionKey)) {
       try {
-        const isGemini = apiKey.startsWith("AIza");
+        const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+        const promptText = `
+You are the RIZZ AI dating wingman. 
+Look at the attached dating app chat screenshot or profile.
+Match tone: "${tone.toUpperCase()}".
+Additional context: "${effectiveContext}".
 
-        if (isGemini) {
-          const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
-          const promptText = `
-You are the RIZZ AI dating assistant wingman. 
-A user uploaded a dating app screenshot and selected the tone: "${tone.toUpperCase()}".
-${text ? `Context: "${text}"` : ""}
-
-Generate exactly 3 distinct, high-impact dating reply suggestions matching the "${tone}" vibe.
-Respond strictly in valid JSON format:
+Generate 3 high-impact dating reply suggestions directly reacting to what the person said or their bio in the screenshot.
+Respond strictly in JSON:
 {
   "suggestions": [
     {
@@ -279,58 +295,59 @@ Respond strictly in valid JSON format:
 }
 `;
 
-          const contentsParts: any[] = [{ text: promptText }];
-          if (image && typeof image === "string" && image.startsWith("data:")) {
-            const matches = image.match(/^data:([a-zA-Z0-9]+\/[a-zA-Z0-9-.+]+);base64,(.+)$/);
-            if (matches && matches.length === 3) {
-              contentsParts.unshift({
-                inlineData: { mimeType: matches[1], data: matches[2] },
+        const contentsParts: any[] = [{ text: promptText }];
+        if (image && typeof image === "string" && image.startsWith("data:")) {
+          const matches = image.match(/^data:([a-zA-Z0-9]+\/[a-zA-Z0-9-.+]+);base64,(.+)$/);
+          if (matches && matches.length === 3) {
+            contentsParts.unshift({
+              inlineData: { mimeType: matches[1], data: matches[2] },
+            });
+          }
+        }
+
+        const geminiRes = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: contentsParts }],
+            generationConfig: {
+              temperature: 0.85,
+              responseMimeType: "application/json",
+            },
+          }),
+        });
+
+        if (geminiRes.ok) {
+          const geminiData = await geminiRes.json();
+          const textResponse = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (textResponse) {
+            const parsed = parseJsonSafe(textResponse);
+            if (Array.isArray(parsed.suggestions) && parsed.suggestions.length > 0) {
+              return NextResponse.json({
+                success: true,
+                tone,
+                isLiveAI: true,
+                engine: "Gemini Vision AI",
+                keyDetected: true,
+                suggestions: parsed.suggestions.slice(0, 3).map((item: any, idx: number) => ({
+                  id: `gemini-${Date.now()}-${idx}`,
+                  category: item.category || (idx === 0 ? "The Icebreaker" : idx === 1 ? "Smooth Pivot" : "Playful Tease"),
+                  text: item.text,
+                  score: item.score || `${95 + Math.floor(Math.random() * 5)}% Match`,
+                  vibe: item.vibe || tone,
+                  deliveryTip: item.deliveryTip || "Send with confidence.",
+                })),
               });
             }
           }
-
-          const geminiRes = await fetch(endpoint, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [{ parts: contentsParts }],
-              generationConfig: {
-                temperature: 0.85,
-                responseMimeType: "application/json",
-              },
-            }),
-          });
-
-          if (geminiRes.ok) {
-            const geminiData = await geminiRes.json();
-            const textResponse = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
-            if (textResponse) {
-              const parsed = parseJsonSafe(textResponse);
-              if (Array.isArray(parsed.suggestions) && parsed.suggestions.length > 0) {
-                return NextResponse.json({
-                  success: true,
-                  tone,
-                  isLiveAI: true,
-                  engine: "Gemini Vision AI",
-                  suggestions: parsed.suggestions.slice(0, 3).map((item: any, idx: number) => ({
-                    id: `ai-${Date.now()}-${idx}`,
-                    category: item.category || (idx === 0 ? "The Icebreaker" : idx === 1 ? "Smooth Pivot" : "Playful Tease"),
-                    text: item.text,
-                    score: item.score || `${95 + Math.floor(Math.random() * 5)}% Match`,
-                    vibe: item.vibe || tone,
-                    deliveryTip: item.deliveryTip || "Send with confidence.",
-                  })),
-                });
-              }
-            }
-          }
         }
-      } catch (err) {
-        console.error("AI API execution error:", err);
+      } catch (err: any) {
+        lastError = `Gemini call error: ${err.message}`;
+        console.error("Gemini call failed:", err);
       }
     }
 
-    // Dynamic rotation for curated fallback so each generation feels fresh
+    // Dynamic rotation for curated fallback
     const shuffled = [...fallbackList].sort(() => 0.5 - Math.random());
     const prepared = shuffled.map((item, index) => ({
       ...item,
@@ -341,7 +358,10 @@ Respond strictly in valid JSON format:
       success: true,
       tone,
       isLiveAI: false,
-      engine: apiKey ? "RIZZ Fallback Engine" : "RIZZ Curated Engine",
+      keyDetected: !!apiKey,
+      detectedKeyName,
+      lastError,
+      engine: apiKey ? "RIZZ Fallback (Redeploy Needed)" : "RIZZ Curated Engine",
       suggestions: prepared,
     });
   } catch (error: any) {
@@ -349,7 +369,7 @@ Respond strictly in valid JSON format:
     return NextResponse.json(
       {
         success: false,
-        error: "Failed to generate rizz",
+        error: error.message || "Failed to generate rizz",
         suggestions: VIBE_TEMPLATES.flirty,
       },
       { status: 500 }
